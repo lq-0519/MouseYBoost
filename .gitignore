@@ -1,0 +1,7 @@
+# Build products and compiler caches belong outside the source repository.
+.DS_Store
+*.app/
+*.o
+.build/
+build/
+dist/

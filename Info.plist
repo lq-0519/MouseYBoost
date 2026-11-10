@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.local.MouseYBoost</string>
+    <key>CFBundleName</key>
+    <string>MouseYBoost</string>
+    <key>CFBundleDisplayName</key>
+    <string>MouseYBoost</string>
+    <key>CFBundleExecutable</key>
+    <string>MouseYBoost</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <key>NSAccessibilityUsageDescription</key>
+    <string>仅为罗技外接鼠标调整指针的纵向移动速度。</string>
+</dict>
+</plist>
