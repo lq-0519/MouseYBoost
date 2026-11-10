@@ -4,7 +4,7 @@ import ApplicationServices
 /// Immutable worker configuration. Display rectangles use Quartz global
 /// coordinates so vertically arranged and scaled displays share one space.
 struct MouseConfiguration: Equatable {
-    /// Requested gain of the vertical event delta; X is never rewritten.
+    /// Requested gain of the physical vertical displacement; X is never rewritten.
     let gain: Double
     /// Cached desktop geometry, refreshed only when the display layout changes.
     let displays: [CGRect]
@@ -67,7 +67,7 @@ final class MouseEngine {
             inactive = .unchanged
         } else if asleep {
             inactive = .sleeping
-        } else if !trusted {
+        } else if !trusted || !CGPreflightPostEventAccess() {
             inactive = .permissionRequired
         } else {
             inactive = nil
@@ -127,7 +127,7 @@ private struct DesktopStrip {
 
 /// Event-thread implementation. No preferences, UI, timers, or disk writes occur
 /// in the callback. Only cancellation/run-loop publication uses a mutex.
-private final class MouseWorker {
+final class MouseWorker {
     /// Immutable settings for the full lifetime of this worker.
     private let configuration: MouseConfiguration
     /// Sparse status callback is dispatched to the main thread by MouseEngine.
@@ -154,11 +154,31 @@ private final class MouseWorker {
     private let desktopStrips: [DesktopStrip]
     /// Most movement remains in this strip, requiring only a containment check.
     private var cachedStripIndex: Int?
+    /// Marks this worker's replacement motion before any device lookup or
+    /// fractional accounting, preventing synthetic input from feeding back.
+    static let replacementMarker: Int64 = 0x4D59424F4F5354
+    /// One reusable source posts motion without suppressing subsequent physical
+    /// input. Creating a source per event would add unnecessary callback work.
+    private let replacementSource: CGEventSource?
+    /// Position of the preceding motion as observed in event-pipeline order.
+    /// Unlike querying the live cursor on every callback, this remains stable
+    /// when several input events are already waiting in the run-loop queue.
+    private var precedingY: CGFloat?
+    /// Latest requested output while replacement events are still in flight.
+    /// New input accumulates here so an older queued coordinate cannot undo
+    /// the gain of an earlier event.
+    private var pendingOutputY: CGFloat?
+    /// Counts replacements until they return through this tap. Tagged events
+    /// acknowledge delivery without being scaled again.
+    private var pendingReplacements = 0
 
     /// Creates a worker without starting a thread or touching input permissions.
     init(configuration: MouseConfiguration) {
         self.configuration = configuration
         desktopStrips = Self.makeDesktopStrips(configuration.displays)
+        replacementSource = CGEventSource(stateID: .combinedSessionState)
+        replacementSource?.localEventsSuppressionInterval = 0
+        replacementSource?.userData = Self.replacementMarker
     }
 
     /// Installs the tap on a dedicated sleeping run loop. Cleanup stays on that
@@ -168,6 +188,10 @@ private final class MouseWorker {
         let shouldStart = !canceled
         lifecycleLock.unlock()
         guard shouldStart else { return }
+        guard replacementSource != nil else {
+            onStateChanged?(.failure("无法创建鼠标事件来源，增益未开启"))
+            return
+        }
         let eventTypes: [CGEventType] = [
             .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged,
         ]
@@ -181,8 +205,8 @@ private final class MouseWorker {
             callback: { _, type, event, context in
                 guard let context else { return Unmanaged.passUnretained(event) }
                 let worker = Unmanaged<MouseWorker>.fromOpaque(context).takeUnretainedValue()
-                worker.handle(type: type, event: event)
-                return Unmanaged.passUnretained(event)
+                return worker.handle(type: type, event: event)
+                    ? nil : Unmanaged.passUnretained(event)
             },
             userInfo: context
         ) else {
@@ -229,10 +253,10 @@ private final class MouseWorker {
         CFRunLoopWakeUp(loop)
     }
 
-    /// Adjusts only identified physical Logitech motion. The existing event is
-    /// forwarded with its buttons/modifiers/X untouched; cursor warping creates
-    /// no synthetic events and therefore cannot feed back into this callback.
-    private func handle(type: CGEventType, event: CGEvent) {
+    /// Filters device sources and handles tap lifecycle notifications. True means
+    /// a replacement was posted, so the original must not also reach the cursor.
+    /// Trackpad, unidentified, and already-tagged input always passes through.
+    func handle(type: CGEventType, event: CGEvent) -> Bool {
         if type == .tapDisabledByTimeout {
             timeoutCount += 1
             if timeoutCount <= 3, let tap {
@@ -242,20 +266,29 @@ private final class MouseWorker {
                 onStateChanged?(.failure("系统连续暂停了鼠标监听，请重新启用"))
                 CFRunLoopStop(CFRunLoopGetCurrent())
             }
-            return
+            return false
         }
         if type == .tapDisabledByUserInput {
             onStateChanged?(.failure("鼠标监听已被系统暂停，请检查权限后重新启用"))
             CFRunLoopStop(CFRunLoopGetCurrent())
-            return
+            return false
         }
         timeoutCount = 0
+        if event.getIntegerValueField(.eventSourceUserData) == Self.replacementMarker {
+            precedingY = event.location.y
+            if pendingReplacements > 0 { pendingReplacements -= 1 }
+            if pendingReplacements == 0 { pendingOutputY = nil }
+            return false
+        }
         let sender = MYBEventSenderID(event)
         if sender != previousSender {
             previousSender = sender
             remainderY = 0
         }
-        guard sender != 0 else { return }
+        guard sender != 0 else {
+            precedingY = event.location.y
+            return false
+        }
         let classification: Int
         if let cached = senders[sender] {
             classification = cached
@@ -264,37 +297,88 @@ private final class MouseWorker {
             if senders.count >= 64 { senders.removeAll(keepingCapacity: true) }
             senders[sender] = classification
         }
-        guard classification == 1 else { return }
+        guard classification == 1 else {
+            precedingY = event.location.y
+            pendingOutputY = nil
+            return false
+        }
         if !observedMouse {
             observedMouse = true
             onStateChanged?(.active)
         }
-        let deltaY = event.getIntegerValueField(.mouseEventDeltaY)
-        guard deltaY != 0 else { return }
-        let extra = Double(deltaY) * (configuration.gain - 1) + remainderY
+        return transformMotionEvent(event)
+    }
+
+    /// Replaces eligible motion through the normal event pipeline, preserving
+    /// horizontal position, drag buttons, modifiers, pressure, and click state.
+    /// CGWarpMouseCursorPosition suppresses subsequent physical cursor movement
+    /// on this system and must never be used in the production input callback.
+    ///
+    /// Displacement between consecutive pipeline positions already includes
+    /// macOS pointer acceleration. Only its Y component receives extra gain;
+    /// neither raw HID displacement nor system acceleration settings are changed.
+    /// The live cursor supplies the initial baseline only. Later baselines come
+    /// from ordered events because the live cursor may lag during queued input.
+    /// mouseEventDeltaY includes preceding synthetic adjustments on this system
+    /// and therefore cannot be scaled directly.
+    /// The caller alone authorizes the device; diagnostics reuse this exact core.
+    func transformMotionEvent(_ event: CGEvent) -> Bool {
+        let original = event.location
+        guard original.x.isFinite, original.y.isFinite,
+              let baseline = precedingY ?? CGEvent(source: nil)?.location.y,
+              baseline.isFinite else {
+            remainderY = 0
+            return false
+        }
+        precedingY = original.y
+        let acceleratedY = original.y - baseline
+        let extra = acceleratedY * (configuration.gain - 1) + remainderY
         let roundedExtra = extra.rounded(.towardZero)
         remainderY = extra - roundedExtra
-        guard roundedExtra != 0 else { return }
-        let original = event.location
-        guard original.x.isFinite, original.y.isFinite else {
-            remainderY = 0
-            return
-        }
-        let targetY = clampY(original.y + roundedExtra, atX: original.x, fromY: original.y)
+        let requestedY = (pendingOutputY ?? baseline) + acceleratedY + roundedExtra
+        guard requestedY != original.y else { return false }
+        let targetY = clampY(requestedY, atX: original.x, fromY: original.y)
         let applied = targetY - original.y
         guard applied != 0 else {
             remainderY = 0
-            return
+            return false
         }
-        let target = CGPoint(x: original.x, y: targetY)
-        guard CGWarpMouseCursorPosition(target) == .success else {
+        let button: CGMouseButton = event.type == .rightMouseDragged ? .right
+            : event.type == .otherMouseDragged ? .center : .left
+        guard let replacementSource,
+              let replacement = CGEvent(mouseEventSource: replacementSource,
+                                         mouseType: event.type,
+                                         mouseCursorPosition: CGPoint(x: original.x, y: targetY),
+                                         mouseButton: button) else {
             remainderY = 0
-            onStateChanged?(.failure("系统拒绝调整指针位置，请检查辅助功能权限"))
+            onStateChanged?(.failure("无法创建鼠标移动事件，增益已暂停"))
             CFRunLoopStop(CFRunLoopGetCurrent())
-            return
+            return false
         }
-        event.location = target
-        event.setIntegerValueField(.mouseEventDeltaY, value: deltaY + Int64(applied))
+        // A fresh mouse event excludes the original HID payload, which must not
+        // be reintroduced as physical input. Copy the public motion/button state
+        // explicitly; the new source owns only this tagged synthetic event.
+        replacement.flags = event.flags
+        replacement.setIntegerValueField(.mouseEventButtonNumber,
+                                          value: event.getIntegerValueField(.mouseEventButtonNumber))
+        replacement.setIntegerValueField(.mouseEventNumber,
+                                          value: event.getIntegerValueField(.mouseEventNumber))
+        replacement.setIntegerValueField(.mouseEventClickState,
+                                          value: event.getIntegerValueField(.mouseEventClickState))
+        replacement.setIntegerValueField(.mouseEventSubtype,
+                                          value: event.getIntegerValueField(.mouseEventSubtype))
+        replacement.setDoubleValueField(.mouseEventPressure,
+                                         value: event.getDoubleValueField(.mouseEventPressure))
+        replacement.setIntegerValueField(.mouseEventDeltaX,
+                                          value: event.getIntegerValueField(.mouseEventDeltaX))
+        replacement.setIntegerValueField(.eventSourceUserData, value: Self.replacementMarker)
+        replacement.flags.insert(.maskNonCoalesced)
+        replacement.location = CGPoint(x: original.x, y: targetY)
+        replacement.setIntegerValueField(.mouseEventDeltaY, value: Int64(acceleratedY + applied))
+        pendingOutputY = targetY
+        pendingReplacements += 1
+        replacement.post(tap: .cghidEventTap)
+        return true
     }
 
     /// Clamps to the connected desktop interval containing the input event.

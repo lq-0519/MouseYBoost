@@ -15,7 +15,7 @@ enum LoginItem {
         case .enabled: return "登录后在菜单栏运行"
         case .requiresApproval: return "已申请自启动，请在系统登录项中允许"
         case .notRegistered: return "不会在登录时自动启动"
-        case .notFound: return "请从 /Applications/MouseYBoost.app 启动后设置"
+        case .notFound: return "自启动尚未就绪，可勾选重新设置"
         @unknown default: return "请在系统登录项中查看状态"
         }
     }
