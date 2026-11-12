@@ -157,6 +157,17 @@ final class MouseWorker {
     /// Marks this worker's replacement motion before any device lookup or
     /// fractional accounting, preventing synthetic input from feeding back.
     static let replacementMarker: Int64 = 0x4D59424F4F5354
+    /// The upper 32 bits identify this utility's events; lower bits distinguish
+    /// motion batches without relying on timestamps that posting may rewrite.
+    private static let replacementMarkerMask: Int64 = -0x1_0000_0000
+    /// Changes whenever a button, device, or tap transition invalidates queued
+    /// motion. A random starting value also separates successive worker instances.
+    private var replacementGeneration = UInt32.random(in: .min ... .max)
+    /// Tags new output with the current batch so a delayed event from an earlier
+    /// drag cannot acknowledge new output or overwrite the new position baseline.
+    private var currentReplacementMarker: Int64 {
+        (Self.replacementMarker & Self.replacementMarkerMask) | Int64(replacementGeneration)
+    }
     /// One reusable source posts motion without suppressing subsequent physical
     /// input. Creating a source per event would add unnecessary callback work.
     private let replacementSource: CGEventSource?
@@ -168,8 +179,8 @@ final class MouseWorker {
     /// New input accumulates here so an older queued coordinate cannot undo
     /// the gain of an earlier event.
     private var pendingOutputY: CGFloat?
-    /// Counts replacements until they return through this tap. Tagged events
-    /// acknowledge delivery without being scaled again.
+    /// Counts replacements until they return through this tap. Button, source,
+    /// and tap transitions discard this count together with the pending position.
     private var pendingReplacements = 0
 
     /// Creates a worker without starting a thread or touching input permissions.
@@ -178,7 +189,7 @@ final class MouseWorker {
         desktopStrips = Self.makeDesktopStrips(configuration.displays)
         replacementSource = CGEventSource(stateID: .combinedSessionState)
         replacementSource?.localEventsSuppressionInterval = 0
-        replacementSource?.userData = Self.replacementMarker
+        replacementSource?.userData = currentReplacementMarker
     }
 
     /// Installs the tap on a dedicated sleeping run loop. Cleanup stays on that
@@ -194,6 +205,8 @@ final class MouseWorker {
         }
         let eventTypes: [CGEventType] = [
             .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged,
+            .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp,
+            .otherMouseDown, .otherMouseUp,
         ]
         let mask = eventTypes.reduce(CGEventMask(0)) {
             $0 | (CGEventMask(1) << $1.rawValue)
@@ -259,8 +272,8 @@ final class MouseWorker {
     func handle(type: CGEventType, event: CGEvent) -> Bool {
         if type == .tapDisabledByTimeout {
             timeoutCount += 1
+            resetMotionTracking()
             if timeoutCount <= 3, let tap {
-                remainderY = 0
                 CGEvent.tapEnable(tap: tap, enable: true)
             } else {
                 onStateChanged?(.failure("系统连续暂停了鼠标监听，请重新启用"))
@@ -274,11 +287,23 @@ final class MouseWorker {
             return false
         }
         timeoutCount = 0
-        if event.getIntegerValueField(.eventSourceUserData) == Self.replacementMarker {
+        let marker = event.getIntegerValueField(.eventSourceUserData)
+        if marker & Self.replacementMarkerMask == Self.replacementMarker & Self.replacementMarkerMask {
+            guard marker == currentReplacementMarker, pendingReplacements > 0 else { return false }
             precedingY = event.location.y
-            if pendingReplacements > 0 { pendingReplacements -= 1 }
+            pendingReplacements -= 1
             if pendingReplacements == 0 { pendingOutputY = nil }
             return false
+        }
+        switch type {
+        case .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp,
+             .otherMouseDown, .otherMouseUp:
+            // Button events carry the actual click/release position. They form
+            // a boundary even when drag packets contain no identifiable sender.
+            resetMotionTracking(at: event.location)
+            return false
+        default:
+            break
         }
         let sender = MYBEventSenderID(event)
         if sender != previousSender {
@@ -286,7 +311,7 @@ final class MouseWorker {
             remainderY = 0
         }
         guard sender != 0 else {
-            precedingY = event.location.y
+            resetMotionTracking(at: event.location)
             return false
         }
         let classification: Int
@@ -298,8 +323,7 @@ final class MouseWorker {
             senders[sender] = classification
         }
         guard classification == 1 else {
-            precedingY = event.location.y
-            pendingOutputY = nil
+            resetMotionTracking(at: event.location)
             return false
         }
         if !observedMouse {
@@ -307,6 +331,19 @@ final class MouseWorker {
             onStateChanged?(.active)
         }
         return transformMotionEvent(event)
+    }
+
+    /// Starts a new motion baseline without changing or synthesizing input.
+    /// Unidentified drag packets and button transitions may move the cursor far
+    /// from the last boosted event. Discard its pending coordinate and rounding
+    /// remainder together; late acknowledgements must not undo this reset.
+    private func resetMotionTracking(at location: CGPoint? = nil) {
+        replacementGeneration &+= 1
+        replacementSource?.userData = currentReplacementMarker
+        pendingReplacements = 0
+        pendingOutputY = nil
+        remainderY = 0
+        precedingY = location.flatMap { $0.y.isFinite ? $0.y : nil }
     }
 
     /// Replaces eligible motion through the normal event pipeline, preserving
@@ -327,7 +364,7 @@ final class MouseWorker {
         guard original.x.isFinite, original.y.isFinite,
               let baseline = precedingY ?? CGEvent(source: nil)?.location.y,
               baseline.isFinite else {
-            remainderY = 0
+            resetMotionTracking()
             return false
         }
         precedingY = original.y
@@ -371,7 +408,7 @@ final class MouseWorker {
                                          value: event.getDoubleValueField(.mouseEventPressure))
         replacement.setIntegerValueField(.mouseEventDeltaX,
                                           value: event.getIntegerValueField(.mouseEventDeltaX))
-        replacement.setIntegerValueField(.eventSourceUserData, value: Self.replacementMarker)
+        replacement.setIntegerValueField(.eventSourceUserData, value: currentReplacementMarker)
         replacement.flags.insert(.maskNonCoalesced)
         replacement.location = CGPoint(x: original.x, y: targetY)
         replacement.setIntegerValueField(.mouseEventDeltaY, value: Int64(acceleratedY + applied))
