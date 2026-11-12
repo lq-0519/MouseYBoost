@@ -4,38 +4,71 @@ import ApplicationServices
 /// Immutable worker configuration. Display rectangles use Quartz global
 /// coordinates so vertically arranged and scaled displays share one space.
 struct MouseConfiguration: Equatable {
-    /// Requested gain of the physical vertical displacement; X is never rewritten.
-    let gain: Double
+    /// Enables only identified external Logitech pointer events. Trackpad
+    /// eligibility is controlled independently by trackpadEnabled.
+    let mouseEnabled: Bool
+    /// Enables identified trackpad pointer events independently of the mouse.
+    let trackpadEnabled: Bool
+    /// Extra vertical gain for external Logitech input only; one is pass-through.
+    let mouseGain: Double
+    /// Extra vertical gain for trackpad input only, independent of mouseGain.
+    let trackpadGain: Double
     /// Cached desktop geometry, refreshed only when the display layout changes.
     let displays: [CGRect]
+
+    /// Indicates whether mouse input needs the worker. A checked switch at one
+    /// remains a user preference but does not require modifying mouse events.
+    var boostsMouse: Bool { mouseEnabled && mouseGain != 1 }
+
+    /// Indicates whether trackpad input needs gain, including while the mouse
+    /// switch is off or its independent multiplier is set to one.
+    var boostsTrackpad: Bool { trackpadEnabled && trackpadGain != 1 }
+
+    /// Names only enabled categories with gain above one for the waiting state;
+    /// devices set to their system speed are never reported as awaiting gain.
+    var deviceDescription: String {
+        if boostsMouse && boostsTrackpad { return "罗技鼠标和触控板" }
+        return boostsMouse ? "罗技鼠标" : "触控板"
+    }
+
+    /// Selects the saved multiplier only after the sender has been classified.
+    /// Nil leaves disabled, unit-gain, unsupported, and unknown input untouched.
+    func gain(for device: MYBDeviceKind) -> Double? {
+        switch device {
+        case .logitechMouse where boostsMouse: return mouseGain
+        case .trackpad where boostsTrackpad: return trackpadGain
+        default: return nil
+        }
+    }
 }
 
 /// Runtime state is published only on transitions, never on every mouse event.
 enum EngineState: Equatable {
-    /// User has turned off processing.
+    /// User has turned off both independent device switches.
     case disabled
-    /// Gain is one, so the worker is not needed.
+    /// All enabled devices use unit gain, so the worker is not needed.
     case unchanged
     /// Accessibility permission is required before a modifying tap can run.
     case permissionRequired
     /// Machine is asleep; the tap has been removed.
     case sleeping
-    /// Tap is ready and has not yet observed an identified Logitech mouse.
-    case waitingForMouse
-    /// At least one identified external Logitech motion event was received.
-    case active
+    /// Tap is ready but has not yet observed input from the named enabled devices.
+    case waitingForInput(String)
+    /// Identified input was received from the named enabled device categories.
+    /// Each newly observed category updates this state once per worker lifetime.
+    case active(String)
     /// A recoverable start or runtime error is shown in the settings window.
     case failure(String)
 
     /// Short human-readable state for the menu and settings window.
     var text: String {
         switch self {
-        case .disabled: return "已关闭 · 没有鼠标事件监听"
-        case .unchanged: return "1 倍原速 · 没有鼠标事件监听"
+        case .disabled: return "鼠标和触控板增益均已关闭 · 没有事件监听"
+        case .unchanged: return "已启用设备均为 1 倍原速 · 没有事件监听"
         case .permissionRequired: return "需要开启辅助功能权限"
         case .sleeping: return "电脑休眠中 · 已暂停"
-        case .waitingForMouse: return "监听已开启 · 等待罗技鼠标移动"
-        case .active: return "正在为罗技外接鼠标提供纵向增益"
+        case let .waitingForInput(devices): return "监听已开启 · 等待\(devices)移动"
+        case let .active(devices): return "纵向增益已生效 · \(devices)"
         case let .failure(message): return message
         }
     }
@@ -56,14 +89,20 @@ final class MouseEngine {
     /// Snapshot avoids restarting a healthy tap for unrelated app activation.
     private var configuration: MouseConfiguration?
 
-    /// Applies settings and permission status; starting at one or while disabled
-    /// requires no event tap, background timer, or device observer.
-    func apply(enabled: Bool, gain: Double, trusted: Bool, asleep: Bool,
+    /// Applies independent switches and multipliers. The worker runs only when
+    /// at least one enabled device needs gain; each other category passes through.
+    func apply(mouseEnabled: Bool, trackpadEnabled: Bool,
+               mouseGain: Double, trackpadGain: Double,
+               trusted: Bool, asleep: Bool,
                displays: [CGRect]) {
+        let next = MouseConfiguration(mouseEnabled: mouseEnabled,
+                                      trackpadEnabled: trackpadEnabled,
+                                      mouseGain: mouseGain, trackpadGain: trackpadGain,
+                                      displays: displays)
         let inactive: EngineState?
-        if !enabled {
+        if !mouseEnabled && !trackpadEnabled {
             inactive = .disabled
-        } else if gain == 1 {
+        } else if !next.boostsMouse && !next.boostsTrackpad {
             inactive = .unchanged
         } else if asleep {
             inactive = .sleeping
@@ -79,10 +118,9 @@ final class MouseEngine {
         }
         guard MYBDeviceBridgeAvailable() else {
             stop()
-            publish(.failure("当前系统无法识别鼠标来源，增益未开启"))
+            publish(.failure("当前系统无法识别指针设备来源，增益未开启"))
             return
         }
-        let next = MouseConfiguration(gain: gain, displays: displays)
         guard configuration != next || worker == nil else { return }
         stop()
         configuration = next
@@ -141,13 +179,17 @@ final class MouseWorker {
     /// The tap port belongs exclusively to the worker thread.
     private var tap: CFMachPort?
     /// Bounded registry classification cache avoids IOKit calls on recurring input.
-    private var senders: [UInt64: Int] = [:]
+    private var senders: [UInt64: MYBDeviceKind] = [:]
     /// Fractional extra displacement prevents small gains from rounding to zero.
     private var remainderY = 0.0
-    /// Sender changes reset rounding state between independent physical devices.
+    /// Sender changes reset the complete motion baseline and pending output,
+    /// preventing one physical device from inheriting another device's gain.
     private var previousSender: UInt64 = 0
-    /// Tracks first matching input so it produces only one UI notification.
+    /// Tracks first matching mouse input for sparse, device-specific status.
     private var observedMouse = false
+    /// Tracks first matching trackpad input independently of mouse activity, so
+    /// enabling both devices never reports an unobserved category as active.
+    private var observedTrackpad = false
     /// Consecutive timeout notifications allow bounded immediate tap recovery.
     private var timeoutCount = 0
     /// Desktop strips are precomputed once, outside the input callback.
@@ -240,7 +282,7 @@ final class MouseWorker {
         lifecycleLock.unlock()
         if !alreadyCanceled {
             CGEvent.tapEnable(tap: port, enable: true)
-            onStateChanged?(.waitingForMouse)
+            onStateChanged?(.waitingForInput(configuration.deviceDescription))
             CFRunLoopRun()
         }
         CGEvent.tapEnable(tap: port, enable: false)
@@ -266,9 +308,10 @@ final class MouseWorker {
         CFRunLoopWakeUp(loop)
     }
 
-    /// Filters device sources and handles tap lifecycle notifications. True means
-    /// a replacement was posted, so the original must not also reach the cursor.
-    /// Trackpad, unidentified, and already-tagged input always passes through.
+    /// Routes each identified device through its independent switch. True
+    /// suppresses replaced physical input or obsolete synthetic output. Disabled
+    /// and unidentified devices pass through, and current tagged output is never
+    /// amplified again. Scroll and gesture events are outside the tap's mask.
     func handle(type: CGEventType, event: CGEvent) -> Bool {
         if type == .tapDisabledByTimeout {
             timeoutCount += 1
@@ -289,7 +332,10 @@ final class MouseWorker {
         timeoutCount = 0
         let marker = event.getIntegerValueField(.eventSourceUserData)
         if marker & Self.replacementMarkerMask == Self.replacementMarker & Self.replacementMarkerMask {
-            guard marker == currentReplacementMarker, pendingReplacements > 0 else { return false }
+            // A queued position from before a device/button transition must not
+            // reach the cursor after a new device has established its baseline.
+            guard marker == currentReplacementMarker else { return true }
+            guard pendingReplacements > 0 else { return false }
             precedingY = event.location.y
             pendingReplacements -= 1
             if pendingReplacements == 0 { pendingOutputY = nil }
@@ -306,31 +352,49 @@ final class MouseWorker {
             break
         }
         let sender = MYBEventSenderID(event)
-        if sender != previousSender {
+        let senderChanged = sender != previousSender
+        if senderChanged {
             previousSender = sender
-            remainderY = 0
+            resetMotionTracking(at: event.location)
         }
         guard sender != 0 else {
             resetMotionTracking(at: event.location)
             return false
         }
-        let classification: Int
+        let classification: MYBDeviceKind
         if let cached = senders[sender] {
             classification = cached
         } else {
-            classification = Int(MYBClassifySender(sender))
+            classification = MYBClassifySender(sender)
             if senders.count >= 64 { senders.removeAll(keepingCapacity: true) }
             senders[sender] = classification
         }
-        guard classification == 1 else {
+        guard let gain = configuration.gain(for: classification) else {
             resetMotionTracking(at: event.location)
             return false
         }
-        if !observedMouse {
+        publishObservedDevice(classification)
+        // The first position after a sender transition establishes a clean
+        // baseline and passes through; subsequent movement receives the gain.
+        guard !senderChanged else { return false }
+        return transformMotionEvent(event, gain: gain)
+    }
+
+    /// Publishes only the first observation of each enabled device category.
+    /// Mouse and trackpad alternation therefore adds no recurring main-thread
+    /// work, while the status distinguishes one detected device from both.
+    private func publishObservedDevice(_ kind: MYBDeviceKind) {
+        switch kind {
+        case .logitechMouse where !observedMouse:
             observedMouse = true
-            onStateChanged?(.active)
+        case .trackpad where !observedTrackpad:
+            observedTrackpad = true
+        default:
+            return
         }
-        return transformMotionEvent(event)
+        let devices = observedMouse && observedTrackpad ? "罗技鼠标和触控板"
+            : observedMouse ? "罗技鼠标" : "触控板"
+        onStateChanged?(.active(devices))
     }
 
     /// Starts a new motion baseline without changing or synthesizing input.
@@ -358,8 +422,9 @@ final class MouseWorker {
     /// from ordered events because the live cursor may lag during queued input.
     /// mouseEventDeltaY includes preceding synthetic adjustments on this system
     /// and therefore cannot be scaled directly.
-    /// The caller alone authorizes the device; diagnostics reuse this exact core.
-    func transformMotionEvent(_ event: CGEvent) -> Bool {
+    /// The caller authorizes the device and supplies its own saved multiplier;
+    /// the transformation itself remains identical for mouse and trackpad input.
+    func transformMotionEvent(_ event: CGEvent, gain: Double) -> Bool {
         let original = event.location
         guard original.x.isFinite, original.y.isFinite,
               let baseline = precedingY ?? CGEvent(source: nil)?.location.y,
@@ -369,7 +434,7 @@ final class MouseWorker {
         }
         precedingY = original.y
         let acceleratedY = original.y - baseline
-        let extra = acceleratedY * (configuration.gain - 1) + remainderY
+        let extra = acceleratedY * (gain - 1) + remainderY
         let roundedExtra = extra.rounded(.towardZero)
         remainderY = extra - roundedExtra
         let requestedY = (pendingOutputY ?? baseline) + acceleratedY + roundedExtra

@@ -3,21 +3,25 @@ import ApplicationServices
 import ServiceManagement
 
 /// Native settings window, created once on demand and refreshed only on events.
-final class SettingsWindow: NSWindowController, NSTextFieldDelegate {
+final class SettingsWindow: NSWindowController {
     /// UI-owned preferences store supplied by the application delegate.
     private let preferences: Preferences
-    /// Applies an enabled/gain change to the running engine immediately.
+    /// Applies either device's independent switch or multiplier immediately.
     var onPreferencesChanged: (() -> Void)?
     /// Explicit refresh lets users apply a newly granted permission without restarting.
     var onRefreshRequested: (() -> Void)?
-    /// Master switch remains available from the window and the menu bar.
-    private let enabledButton = NSButton(checkboxWithTitle: "启用纵向速度增益",
-                                         target: nil, action: nil)
-    /// Continuous slider covers common gains without editing numeric text.
-    private let gainSlider = NSSlider(value: 1.3, minValue: 1, maxValue: 5,
-                                       target: nil, action: nil)
-    /// Editable multiplier accepts values between one and five.
-    private let gainField = NSTextField(string: "")
+    /// Independent mouse switch mirrors the menu and preserves the old setting.
+    private let mouseEnabledButton = NSButton(checkboxWithTitle: "启用鼠标纵向增益",
+                                              target: nil, action: nil)
+    /// Independent trackpad switch starts unchecked and remains usable when
+    /// mouse gain is off, retaining its own stored multiplier between changes.
+    private let trackpadEnabledButton = NSButton(checkboxWithTitle: "启用触控板纵向增益",
+                                                 target: nil, action: nil)
+    /// Mouse-only slider and numeric editor share synchronization behavior with
+    /// the trackpad row but read and write an independent saved multiplier.
+    private let mouseGainControls = GainControls(name: "鼠标纵向增益")
+    /// Trackpad-only slider and numeric editor stay configurable while disabled.
+    private let trackpadGainControls = GainControls(name: "触控板纵向增益")
     /// Actual system registration controls the autostart checkbox.
     private let loginButton = NSButton(checkboxWithTitle: "登录时自动启动",
                                        target: nil, action: nil)
@@ -40,7 +44,7 @@ final class SettingsWindow: NSWindowController, NSTextFieldDelegate {
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 485),
                               styleMask: [.titled, .closable, .miniaturizable],
                               backing: .buffered, defer: false)
-        window.title = "MouseYBoost · 鼠标纵向增益"
+        window.title = "MouseYBoost · 指针纵向增益"
         window.isReleasedWhenClosed = false
         super.init(window: window)
         buildContent()
@@ -59,11 +63,10 @@ final class SettingsWindow: NSWindowController, NSTextFieldDelegate {
 
     /// Reflects stored settings and actual OS state without saving anything.
     func refresh(state: EngineState, trusted: Bool) {
-        enabledButton.state = preferences.enabled ? .on : .off
-        gainSlider.doubleValue = preferences.verticalGain
-        if gainField.currentEditor() == nil {
-            gainField.stringValue = String(format: "%.2f", preferences.verticalGain)
-        }
+        mouseEnabledButton.state = preferences.mouseEnabled ? .on : .off
+        trackpadEnabledButton.state = preferences.trackpadEnabled ? .on : .off
+        mouseGainControls.refresh(value: preferences.mouseVerticalGain)
+        trackpadGainControls.refresh(value: preferences.trackpadVerticalGain)
         stateLabel.stringValue = state.text
         stateLabel.textColor = {
             switch state {
@@ -74,7 +77,7 @@ final class SettingsWindow: NSWindowController, NSTextFieldDelegate {
         }()
         permissionLabel.stringValue = trusted
             ? "辅助功能权限已开启"
-            : "首次使用需要允许 MouseYBoost 调整鼠标事件。"
+            : "首次使用需要允许 MouseYBoost 调整指针事件。"
         permissionButton.title = trusted ? "辅助功能设置…" : "开启辅助功能权限"
         loginButton.state = LoginItem.registered ? .on : .off
         loginLabel.stringValue = LoginItem.statusText
@@ -99,31 +102,28 @@ final class SettingsWindow: NSWindowController, NSTextFieldDelegate {
         let title = NSTextField(labelWithString: "上下移动，更省手腕")
         title.font = .systemFont(ofSize: 23, weight: .semibold)
         stack.addArrangedSubview(title)
-        let subtitle = note("为罗技外接鼠标放大纵向移动。横向、滚轮和触控板保持原有行为。")
+        let subtitle = note("分别配置罗技鼠标和触控板的开关与纵向增益倍数。")
         stack.addArrangedSubview(subtitle)
-        enabledButton.target = self
-        enabledButton.action = #selector(toggleEnabled)
-        stack.addArrangedSubview(enabledButton)
         stateLabel.font = .systemFont(ofSize: 12)
         stack.addArrangedSubview(stateLabel)
         stack.addArrangedSubview(separator())
 
-        let gainTitle = NSTextField(labelWithString: "纵向速度倍数")
-        gainTitle.font = .systemFont(ofSize: 14, weight: .medium)
-        stack.addArrangedSubview(gainTitle)
-        gainSlider.target = self
-        gainSlider.action = #selector(sliderChanged)
-        gainSlider.isContinuous = false
-        gainSlider.widthAnchor.constraint(equalToConstant: 340).isActive = true
-        gainField.delegate = self
-        gainField.alignment = .right
-        gainField.widthAnchor.constraint(equalToConstant: 68).isActive = true
-        gainField.target = self
-        gainField.action = #selector(numberChanged)
-        let gainRow = NSStackView(views: [gainSlider, gainField,
-                                        NSTextField(labelWithString: "倍")])
-        gainRow.spacing = 12
-        stack.addArrangedSubview(gainRow)
+        mouseEnabledButton.target = self
+        mouseEnabledButton.action = #selector(toggleMouseEnabled)
+        stack.addArrangedSubview(mouseEnabledButton)
+        mouseGainControls.onValueChanged = { [weak self] value in
+            self?.preferences.mouseVerticalGain = value
+            self?.onPreferencesChanged?()
+        }
+        stack.addArrangedSubview(mouseGainControls)
+        trackpadEnabledButton.target = self
+        trackpadEnabledButton.action = #selector(toggleTrackpadEnabled)
+        stack.addArrangedSubview(trackpadEnabledButton)
+        trackpadGainControls.onValueChanged = { [weak self] value in
+            self?.preferences.trackpadVerticalGain = value
+            self?.onPreferencesChanged?()
+        }
+        stack.addArrangedSubview(trackpadGainControls)
         stack.addArrangedSubview(note("1 倍为原速；建议从 1.2～1.5 倍开始。范围：1～5 倍。"))
         stack.addArrangedSubview(separator())
 
@@ -149,7 +149,10 @@ final class SettingsWindow: NSWindowController, NSTextFieldDelegate {
         let permissionRow = NSStackView(views: [permissionButton, refreshButton])
         permissionRow.spacing = 12
         stack.addArrangedSubview(permissionRow)
-        stack.addArrangedSubview(note("菜单栏常驻 · 无定时轮询 · 关闭或 1 倍时停止监听"))
+        stack.addArrangedSubview(note("菜单栏常驻 · 没有设备需要增益时停止监听"))
+        // Fit every native control at its intrinsic height, including longer
+        // device/status labels, rather than compressing content into a fixed size.
+        window?.setContentSize(NSSize(width: 560, height: stack.fittingSize.height.rounded(.up) + 44))
     }
 
     /// Makes a subdued wrapping label for short explanations.
@@ -169,35 +172,18 @@ final class SettingsWindow: NSWindowController, NSTextFieldDelegate {
         return box
     }
 
-    /// Persists the master switch and starts/stops the event engine.
-    @objc private func toggleEnabled() {
-        preferences.enabled = enabledButton.state == .on
+    /// Saves only mouse eligibility; an enabled trackpad keeps its gain active.
+    @objc private func toggleMouseEnabled() {
+        preferences.mouseEnabled = mouseEnabledButton.state == .on
         onPreferencesChanged?()
     }
 
-    /// Applies the final slider value once it is released, avoiding tap churn.
-    @objc private func sliderChanged() {
-        preferences.verticalGain = (gainSlider.doubleValue * 100).rounded() / 100
-        gainField.stringValue = String(format: "%.2f", preferences.verticalGain)
+    /// Saves only trackpad eligibility and immediately reapplies its own gain.
+    /// Turning it off never changes the mouse switch or the saved multiplier.
+    @objc private func toggleTrackpadEnabled() {
+        preferences.trackpadEnabled = trackpadEnabledButton.state == .on
         onPreferencesChanged?()
     }
-
-    /// Validates an entered multiplier and restores the saved value if invalid.
-    @objc private func numberChanged() {
-        let text = gainField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let value = Double(text), value.isFinite, (1...5).contains(value) else {
-            gainField.stringValue = String(format: "%.2f", preferences.verticalGain)
-            NSSound.beep()
-            return
-        }
-        preferences.verticalGain = (value * 100).rounded() / 100
-        gainField.stringValue = String(format: "%.2f", preferences.verticalGain)
-        gainSlider.doubleValue = preferences.verticalGain
-        onPreferencesChanged?()
-    }
-
-    /// Commits a numeric edit when focus leaves the field as well as on Return.
-    func controlTextDidEndEditing(_ obj: Notification) { numberChanged() }
 
     /// Updates the real macOS login item and displays registration errors.
     @objc private func toggleLogin() {
@@ -226,4 +212,97 @@ final class SettingsWindow: NSWindowController, NSTextFieldDelegate {
 
     /// Opens native login item settings when registration needs user approval.
     @objc private func openLoginSettings() { SMAppService.openSystemSettingsLoginItems() }
+}
+
+/// One device's native gain row. Both rows use this editor so menu-originated
+/// changes update active field editors consistently without coupling their values.
+private final class GainControls: NSStackView, NSTextFieldDelegate {
+    /// Delivers a validated, rounded value to the owning settings controller,
+    /// which persists the corresponding device setting before refreshing both UIs.
+    var onValueChanged: ((Double) -> Void)?
+    /// Slider commits only on release so moving it does not repeatedly restart
+    /// the input worker before the user finishes choosing a multiplier.
+    private let slider = NSSlider(value: 1.3, minValue: 1, maxValue: 5,
+                                   target: nil, action: nil)
+    /// Numeric input accepts hundredths in the same 1–5 range as the slider.
+    private let field = NSTextField(string: "1.30")
+    /// Last persisted value distinguishes a real external change from an
+    /// unrelated status refresh while the user is still composing numeric text.
+    private var savedValue = 1.3
+
+    /// Builds an independently labeled row with identical numeric validation
+    /// and synchronization behavior for either mouse or trackpad preferences.
+    init(name: String) {
+        super.init(frame: .zero)
+        orientation = .horizontal
+        spacing = 12
+        slider.target = self
+        slider.action = #selector(sliderChanged)
+        slider.isContinuous = false
+        slider.setAccessibilityLabel(name + "倍数")
+        slider.widthAnchor.constraint(equalToConstant: 340).isActive = true
+        field.delegate = self
+        field.alignment = .right
+        field.target = self
+        field.action = #selector(numberChanged)
+        field.setAccessibilityLabel(name + "倍数")
+        field.widthAnchor.constraint(equalToConstant: 68).isActive = true
+        addArrangedSubview(slider)
+        addArrangedSubview(field)
+        addArrangedSubview(NSTextField(labelWithString: "倍"))
+    }
+
+    /// Storyboards are unsupported; each row requires an explicit device label.
+    required init?(coder: NSCoder) { fatalError("Use init(name:)") }
+
+    /// Reflects persisted changes even when the numeric field still owns focus.
+    /// Unchanged values preserve in-progress typing during sparse engine updates;
+    /// changed values replace the editor text to prevent stale text being saved.
+    func refresh(value: Double) {
+        let changed = savedValue != value
+        savedValue = value
+        slider.doubleValue = value
+        if changed || field.currentEditor() == nil {
+            showValue(value)
+        }
+    }
+
+    /// Updates both the control's stored text and AppKit's live field editor.
+    /// Updating only stringValue can leave an active editor displaying old text,
+    /// which would otherwise overwrite a newer menu value when editing ends.
+    private func showValue(_ value: Double) {
+        slider.doubleValue = value
+        let text = String(format: "%.2f", value)
+        field.stringValue = text
+        if let editor = field.currentEditor() {
+            editor.string = text
+            editor.selectAll(nil)
+        }
+    }
+
+    /// Commits a released slider value with hundredth precision and immediately
+    /// replaces any numeric draft with the same formatted value before saving.
+    @objc private func sliderChanged() {
+        let value = (slider.doubleValue * 100).rounded() / 100
+        showValue(value)
+        onValueChanged?(value)
+    }
+
+    /// Validates live editor text on Return or focus loss. Invalid text restores
+    /// the latest persisted value, including changes made through the menu.
+    @objc private func numberChanged() {
+        let text = (field.currentEditor()?.string ?? field.stringValue)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let value = Double(text), value.isFinite, (1...5).contains(value) else {
+            showValue(savedValue)
+            NSSound.beep()
+            return
+        }
+        let rounded = (value * 100).rounded() / 100
+        showValue(rounded)
+        onValueChanged?(rounded)
+    }
+
+    /// Applies the same validation when focus leaves as when Return is pressed.
+    func controlTextDidEndEditing(_ obj: Notification) { numberChanged() }
 }

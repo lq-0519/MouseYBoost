@@ -1,6 +1,9 @@
 #include "DeviceBridge.h"
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
+#include <IOKit/hid/IOHIDDeviceKeys.h>
+#include <IOKit/hid/IOHIDEventServiceKeys.h>
+#include <IOKit/hid/IOHIDUsageTables.h>
 #include <dlfcn.h>
 #include <pthread.h>
 
@@ -46,25 +49,78 @@ static CFTypeRef copyProperty(io_registry_entry_t entry, CFStringRef key) {
         kIORegistryIterateRecursively | kIORegistryIterateParents);
 }
 
-int MYBClassifySender(uint64_t senderID) {
+/// Compares registry numbers without assuming their backing integer width.
+/// Missing or nonnumeric properties are never treated as a matching HID usage.
+static bool numberEquals(CFTypeRef property, int32_t expected) {
+    int32_t value = 0;
+    return property != NULL && CFGetTypeID(property) == CFNumberGetTypeID()
+        && CFNumberGetValue((CFNumberRef)property, kCFNumberSInt32Type, &value)
+        && value == expected;
+}
+
+/// Recognizes built-in and external trackpads using explicit system metadata.
+/// The acceleration type covers the current Apple trackpad event service; an
+/// explicit Digitizer/TouchPad usage covers devices exposing HID usages instead.
+/// A shared keyboard/trackpad product name alone is deliberately insufficient.
+static bool isTrackpad(io_service_t service) {
+    CFTypeRef acceleration = copyProperty(service, CFSTR(kIOHIDPointerAccelerationTypeKey));
+    bool matched = acceleration != NULL
+        && CFGetTypeID(acceleration) == CFStringGetTypeID()
+        && CFEqual(acceleration, CFSTR(kIOHIDTrackpadAccelerationType));
+    if (acceleration != NULL) {
+        CFRelease(acceleration);
+    }
+    if (matched) {
+        return true;
+    }
+    CFTypeRef usages = copyProperty(service, CFSTR(kIOHIDDeviceUsagePairsKey));
+    if (usages != NULL && CFGetTypeID(usages) == CFArrayGetTypeID()) {
+        CFArrayRef pairs = (CFArrayRef)usages;
+        for (CFIndex index = 0; index < CFArrayGetCount(pairs); index++) {
+            CFTypeRef pair = CFArrayGetValueAtIndex(pairs, index);
+            if (pair == NULL || CFGetTypeID(pair) != CFDictionaryGetTypeID()) {
+                continue;
+            }
+            CFDictionaryRef usage = (CFDictionaryRef)pair;
+            if (numberEquals(CFDictionaryGetValue(usage, CFSTR(kIOHIDDeviceUsagePageKey)),
+                             kHIDPage_Digitizer)
+                && numberEquals(CFDictionaryGetValue(usage, CFSTR(kIOHIDDeviceUsageKey)),
+                                kHIDUsage_Dig_TouchPad)) {
+                matched = true;
+                break;
+            }
+        }
+    }
+    if (usages != NULL) {
+        CFRelease(usages);
+    }
+    return matched;
+}
+
+MYBDeviceKind MYBClassifySender(uint64_t senderID) {
     if (senderID == 0) {
-        return -1;
+        return MYBDeviceKindUnknown;
     }
     io_service_t service = IOServiceGetMatchingService(
         kIOMainPortDefault, IORegistryEntryIDMatching(senderID));
     if (service == IO_OBJECT_NULL) {
-        return -1;
+        return MYBDeviceKindUnknown;
+    }
+    if (isTrackpad(service)) {
+        IOObjectRelease(service);
+        return MYBDeviceKindTrackpad;
     }
     CFTypeRef vendor = copyProperty(service, CFSTR("VendorID"));
     CFTypeRef builtIn = copyProperty(service, CFSTR("Built-In"));
-    int result = -1;
+    MYBDeviceKind result = MYBDeviceKindUnknown;
     int32_t vendorID = 0;
     if (vendor != NULL && CFGetTypeID(vendor) == CFNumberGetTypeID()
         && CFNumberGetValue((CFNumberRef)vendor, kCFNumberSInt32Type, &vendorID)) {
         bool isBuiltIn = builtIn != NULL
             && CFGetTypeID(builtIn) == CFBooleanGetTypeID()
             && CFBooleanGetValue((CFBooleanRef)builtIn);
-        result = vendorID == 0x046d && !isBuiltIn ? 1 : 0;
+        result = vendorID == 0x046d && !isBuiltIn
+            ? MYBDeviceKindLogitechMouse : MYBDeviceKindOther;
     }
     if (vendor != NULL) {
         CFRelease(vendor);
