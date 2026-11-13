@@ -21,12 +21,20 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     private var stateMenuItem: NSMenuItem?
     /// Read-only mouse multiplier mirrors the mouse settings row to hundredths.
     private let mouseGainMenuLabel = NSTextField(labelWithString: "")
-    /// Mouse-only arrows remain usable without dismissing the menu each step.
-    private let mouseGainMenuStepper = NSStepper()
+    /// Left mouse button subtracts one 0.1 step with a larger click target than
+    /// a split stepper; it is disabled only when the mouse gain reaches 1.
+    private let mouseGainDecreaseButton = NSButton(title: "−", target: nil, action: nil)
+    /// Right mouse button adds one 0.1 step independently of trackpad settings
+    /// and is disabled when the saved mouse multiplier reaches 5.
+    private let mouseGainIncreaseButton = NSButton(title: "+", target: nil, action: nil)
     /// Read-only trackpad multiplier never follows changes to the mouse value.
     private let trackpadGainMenuLabel = NSTextField(labelWithString: "")
-    /// Trackpad-only arrows write the same independent value as its settings row.
-    private let trackpadGainMenuStepper = NSStepper()
+    /// Left trackpad button reduces only the trackpad multiplier by 0.1, using
+    /// the same larger hit area and minimum-value behavior as the mouse row.
+    private let trackpadGainDecreaseButton = NSButton(title: "−", target: nil, action: nil)
+    /// Right trackpad button increases only the trackpad multiplier by 0.1;
+    /// its enabled state follows the trackpad value rather than the mouse value.
+    private let trackpadGainIncreaseButton = NSButton(title: "+", target: nil, action: nil)
     /// Sleep lifecycle prevents a live event tap while the machine sleeps.
     private var asleep = false
     /// Cached display bounds change only with screen layout notifications.
@@ -128,7 +136,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
     }
 
     /// Creates a compact icon and separate menu groups for mouse and trackpad,
-    /// each with its own multiplier arrows and independent enable checkbox.
+    /// each with its own left/right gain buttons and independent enable checkbox.
     private func buildMenu() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let image = NSImage(systemSymbolName: "arrow.up.and.down",
@@ -146,7 +154,8 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         menu.addItem(stateItem)
         menu.addItem(.separator())
         menu.addItem(makeGainMenuItem(title: "鼠标纵向增益", label: mouseGainMenuLabel,
-                                      stepper: mouseGainMenuStepper,
+                                      decreaseButton: mouseGainDecreaseButton,
+                                      increaseButton: mouseGainIncreaseButton,
                                       action: #selector(changeMouseGainFromMenu(_:))))
         let mouseItem = NSMenuItem(title: "启用鼠标纵向增益",
                                    action: #selector(toggleMouseEnabled), keyEquivalent: "")
@@ -155,7 +164,8 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         menu.addItem(mouseItem)
         menu.addItem(.separator())
         menu.addItem(makeGainMenuItem(title: "触控板纵向增益", label: trackpadGainMenuLabel,
-                                      stepper: trackpadGainMenuStepper,
+                                      decreaseButton: trackpadGainDecreaseButton,
+                                      increaseButton: trackpadGainIncreaseButton,
                                       action: #selector(changeTrackpadGainFromMenu(_:))))
         let trackpadItem = NSMenuItem(title: "启用触控板纵向增益",
                                       action: #selector(toggleTrackpadEnabled), keyEquivalent: "")
@@ -176,42 +186,54 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         statusItem = item
     }
 
-    /// Builds one device's menu row using its own retained label, stepper, and
-    /// action. Both rows use the 1–5 range and 0.1 steps without sharing state,
-    /// wrapping at bounds, or repeatedly changing gain while an arrow is held.
+    /// Builds one device's menu row as a left minus button, centered multiplier,
+    /// and right plus button. Separate 36×32 targets make both directions easier
+    /// to click; momentary buttons apply one step per click and keep the menu open.
+    /// Tags carry only the step direction, while each row retains its own action.
     private func makeGainMenuItem(title text: String, label: NSTextField,
-                                  stepper: NSStepper, action: Selector) -> NSMenuItem {
-        let row = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 38))
+                                  decreaseButton: NSButton, increaseButton: NSButton,
+                                  action: Selector) -> NSMenuItem {
+        let row = NSView(frame: NSRect(x: 0, y: 0, width: 340, height: 46))
         row.autoresizingMask = [.width]
         let title = NSTextField(labelWithString: text)
         title.font = .menuFont(ofSize: 0)
         label.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize,
                                                weight: .medium)
-        label.alignment = .right
+        label.alignment = .center
         label.setAccessibilityLabel(text + "当前倍数")
-        stepper.minValue = 1
-        stepper.maxValue = 5
-        stepper.increment = 0.1
-        stepper.valueWraps = false
-        stepper.autorepeat = false
-        stepper.target = self
-        stepper.action = action
-        stepper.toolTip = "上调增加 0.1 倍，下调减少 0.1 倍（范围 1～5 倍）"
-        stepper.setAccessibilityLabel(text + "倍数")
-        for view in [title, label, stepper] {
+        decreaseButton.tag = -1
+        increaseButton.tag = 1
+        for button in [decreaseButton, increaseButton] {
+            button.bezelStyle = .rounded
+            button.controlSize = .large
+            button.setButtonType(.momentaryPushIn)
+            button.font = .systemFont(ofSize: 18, weight: .medium)
+            button.target = self
+            button.action = action
+            let direction = button.tag < 0 ? "减小" : "增大"
+            button.toolTip = direction + text + " 0.1 倍（范围 1～5 倍）"
+            button.setAccessibilityLabel(direction + text + " 0.1 倍")
+        }
+        for view in [title, label, decreaseButton, increaseButton] {
             view.translatesAutoresizingMaskIntoConstraints = false
             row.addSubview(view)
         }
         NSLayoutConstraint.activate([
             title.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 20),
             title.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-            title.trailingAnchor.constraint(lessThanOrEqualTo: label.leadingAnchor,
-                                            constant: -20),
+            title.trailingAnchor.constraint(lessThanOrEqualTo: decreaseButton.leadingAnchor,
+                                            constant: -16),
+            decreaseButton.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            decreaseButton.widthAnchor.constraint(equalToConstant: 36),
+            decreaseButton.heightAnchor.constraint(equalToConstant: 32),
+            decreaseButton.trailingAnchor.constraint(equalTo: label.leadingAnchor, constant: -8),
             label.centerYAnchor.constraint(equalTo: row.centerYAnchor),
             label.widthAnchor.constraint(equalToConstant: 76),
-            label.trailingAnchor.constraint(equalTo: stepper.leadingAnchor, constant: -10),
-            stepper.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-            stepper.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -20),
+            label.trailingAnchor.constraint(equalTo: increaseButton.leadingAnchor, constant: -8),
+            increaseButton.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            increaseButton.widthAnchor.constraint(equalToConstant: 36),
+            increaseButton.heightAnchor.constraint(equalToConstant: 32),
+            increaseButton.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -20),
         ])
         let item = NSMenuItem(title: text, action: nil, keyEquivalent: "")
         item.view = row
@@ -250,9 +272,11 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         trackpadEnabledMenuItem?.state = preferences.trackpadEnabled ? .on : .off
         stateMenuItem?.title = engine.state.text
         mouseGainMenuLabel.stringValue = String(format: "%.2f 倍", preferences.mouseVerticalGain)
-        mouseGainMenuStepper.doubleValue = preferences.mouseVerticalGain
+        mouseGainDecreaseButton.isEnabled = preferences.mouseVerticalGain > 1
+        mouseGainIncreaseButton.isEnabled = preferences.mouseVerticalGain < 5
         trackpadGainMenuLabel.stringValue = String(format: "%.2f 倍", preferences.trackpadVerticalGain)
-        trackpadGainMenuStepper.doubleValue = preferences.trackpadVerticalGain
+        trackpadGainDecreaseButton.isEnabled = preferences.trackpadVerticalGain > 1
+        trackpadGainIncreaseButton.isEnabled = preferences.trackpadVerticalGain < 5
         settings?.refresh(state: engine.state, trusted: AXIsProcessTrusted())
     }
 
@@ -288,17 +312,19 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate
         applyPreferences()
     }
 
-    /// Changes only mouse gain by one menu step. Refresh updates the settings
-    /// editor even if it still has focus, preventing stale text from reappearing.
-    @objc private func changeMouseGainFromMenu(_ sender: NSStepper) {
-        preferences.mouseVerticalGain = sender.doubleValue
+    /// Changes only mouse gain by 0.1 in the clicked button's direction. The
+    /// preference setter clamps and rounds the result; refresh updates the
+    /// settings editor and disables whichever direction has reached its bound.
+    @objc private func changeMouseGainFromMenu(_ sender: NSButton) {
+        preferences.mouseVerticalGain += Double(sender.tag) * 0.1
         applyPreferences()
     }
 
-    /// Changes only trackpad gain and immediately refreshes both surfaces from
-    /// its saved value, leaving the mouse multiplier and both switches unchanged.
-    @objc private func changeTrackpadGainFromMenu(_ sender: NSStepper) {
-        preferences.trackpadVerticalGain = sender.doubleValue
+    /// Changes only trackpad gain by the left/right button's signed 0.1 step.
+    /// Saving preserves the existing range and hundredth precision, and refresh
+    /// keeps both surfaces current without altering the mouse value or switches.
+    @objc private func changeTrackpadGainFromMenu(_ sender: NSButton) {
+        preferences.trackpadVerticalGain += Double(sender.tag) * 0.1
         applyPreferences()
     }
 
